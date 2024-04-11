@@ -1,16 +1,22 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <chrono>
 #include <curl/curl.h> // Include libcurl for making HTTP requests
 #include <rapidjson/document.h> // Include RapidJSON for JSON parsing
-#include <openssl/hmac.h>
+#include <openssl/sha.h>
+#include <openssl/bio.h>
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/buffer.h>
 #include <iomanip> // Include <iomanip> for setfill and setw
-using namespace std;
+#include <vector>
 
 // Example API endpoint for getting Bitcoin price from CoinGecko
 const std::string COINGECKO_API_ENDPOINT = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd";
-const std::string KRAKEN_API_ENDPOINT = "https://api.kraken.com/0/private/Balance";
+const std::string BINANCE_API_ENDPOINT = "https://api.binance.us/api/v3/ticker/price?symbol=BTCUSD";
+const std::string KRAKEN_API_ENDPOINT = "https://api.kraken.com/0/public/Assets";
+const std::string KRAKEN_API_BALANCE_ENDPOINT = "https://api.kraken.com/0/private/Balance";
 
 
 
@@ -20,6 +26,224 @@ size_t writeCallback(void* contents, size_t size, size_t nmemb, std::string* buf
     buffer->append((char*)contents, totalSize);
     return totalSize;
 }
+
+static std::string generateNonce() {
+    // Get the current time in milliseconds since the epoch
+    auto currentTime = std::chrono::system_clock::now();
+    auto duration = currentTime.time_since_epoch();
+    auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+
+    // Convert milliseconds to a string
+    std::stringstream ss;
+    ss << millis;
+
+    return ss.str();
+}
+
+
+
+static std::vector<unsigned char> sha256(const std::string& data) {
+    std::vector<unsigned char> digest(SHA256_DIGEST_LENGTH);
+
+    // Initialize SHA256 context
+    EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
+    if (mdctx == nullptr) {
+        // Handle error: unable to create EVP_MD_CTX
+        return {};
+    }
+
+    // Initialize SHA256
+    if (EVP_DigestInit_ex(mdctx, EVP_sha256(), nullptr) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        // Handle error: initialization failed
+        return {};
+    }
+
+    // Update SHA256 context with data
+    if (EVP_DigestUpdate(mdctx, data.c_str(), data.length()) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        // Handle error: update failed
+        return {};
+    }
+
+    // Finalize SHA256 hash
+    if (EVP_DigestFinal_ex(mdctx, digest.data(), nullptr) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        // Handle error: finalization failed
+        return {};
+    }
+
+    EVP_MD_CTX_free(mdctx);
+
+    return digest;
+}
+
+static std::vector<unsigned char> b64_decode(const std::string& data) {
+    // Create a BIO for base64 decoding
+    BIO* b64 = BIO_new(BIO_f_base64());
+    if (b64 == nullptr) {
+        throw std::runtime_error("failed to create base64 BIO");
+    }
+
+    // Disable newline characters in base64 encoding
+    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+
+    // Create a memory BIO to read from the input data
+    BIO* bmem = BIO_new_mem_buf(data.c_str(), data.length());
+    if (bmem == nullptr) {
+        BIO_free(b64);
+        throw std::runtime_error("failed to create memory BIO");
+    }
+
+    // Push the base64 BIO onto the memory BIO
+    bmem = BIO_push(b64, bmem);
+
+    // Allocate a buffer for the decoded output
+    std::vector<unsigned char> output(data.length());
+
+    // Read from the BIO chain into the output buffer
+    int decoded_size = BIO_read(bmem, output.data(), output.size());
+
+    // Free the BIOs
+    BIO_free_all(bmem);
+
+    // Check for errors during decoding
+    if (decoded_size < 0) {
+        throw std::runtime_error("failed while decoding base64");
+    }
+
+    // Resize the output buffer to the actual decoded size
+    output.resize(decoded_size);
+
+    return output;
+}
+
+static std::string base64_encode(const std::vector<unsigned char>& data) {
+    BIO* bio, * b64;
+    BUF_MEM* bufferPtr;
+
+    // Create a base64 filter/sink
+    b64 = BIO_new(BIO_f_base64());
+    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+
+    // Create a memory BIO to store the encoded data
+    bio = BIO_new(BIO_s_mem());
+    bio = BIO_push(b64, bio);
+
+    // Write data to the bio
+    BIO_write(bio, data.data(), data.size());
+    BIO_flush(bio);
+
+    // Get a pointer to the memory BIO's data
+    BIO_get_mem_ptr(bio, &bufferPtr);
+
+    // Create a std::string from the data in the memory BIO
+    std::string encodedData(bufferPtr->data, bufferPtr->length);
+
+    // Clean up
+    BIO_free_all(bio);
+
+    return encodedData;
+}
+
+static std::vector<unsigned char> hmac_sha512(const std::vector<unsigned char>& data,
+    const std::vector<unsigned char>& key) {
+    unsigned int len = EVP_MAX_MD_SIZE;
+    std::vector<unsigned char> digest(len);
+
+    HMAC_CTX* ctx = HMAC_CTX_new();
+    if (ctx == nullptr) {
+        // Handle error: unable to create HMAC_CTX
+        return {};
+    }
+
+    if (HMAC_Init_ex(ctx, key.data(), key.size(), EVP_sha512(), NULL) != 1) {
+        HMAC_CTX_free(ctx);
+        // Handle error: initialization failed
+        return {};
+    }
+
+    if (HMAC_Update(ctx, data.data(), data.size()) != 1) {
+        HMAC_CTX_free(ctx);
+        // Handle error: update failed
+        return {};
+    }
+
+    if (HMAC_Final(ctx, digest.data(), &len) != 1) {
+        HMAC_CTX_free(ctx);
+        // Handle error: finalization failed
+        return {};
+    }
+
+    HMAC_CTX_free(ctx);
+    return digest;
+}
+
+
+static std::string generateKrakenSignature(const std::string& urlpath, const std::string& postData, const std::string& apiSecret) {
+    // Concatenate URI path and SHA256 hash of nonce + POST data
+    std::string message = urlpath + sha256(postData);
+
+    // Compute HMAC-SHA512 hash using API secret
+    unsigned char hmacResult[EVP_MAX_MD_SIZE];
+    unsigned int hmacLength = 0;
+    HMAC(EVP_sha512(), apiSecret.c_str(), apiSecret.length(), reinterpret_cast<const unsigned char*>(message.c_str()), message.length(), hmacResult, &hmacLength);
+
+    // Convert hash to hexadecimal string
+    std::stringstream ss;
+    ss << std::hex << std::setfill('0');
+    for (unsigned int i = 0; i < hmacLength; ++i) {
+        ss << std::setw(2) << static_cast<unsigned int>(hmacResult[i]);
+    }
+
+    return ss.str();
+}
+
+std::string getKrakenBalances(const std::string& apiKey, const std::string& apiSecret) {
+    CURL* curl = curl_easy_init();
+    if (curl) {
+        std::string responseBuffer;
+
+        // Generate nonce (timestamp in milliseconds)
+        std::string nonce = generateNonce();
+
+        // Construct POST data
+        std::string postData = "nonce=" + nonce; // Include nonce in the POST data
+
+        // Generate signature
+        std::string signature = generateKrakenSignature("0/private/Balance", postData, apiSecret);
+
+        // Set up CURL options
+        curl_easy_setopt(curl, CURLOPT_URL, "https://api.kraken.com/0/private/Balance");
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postData.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseBuffer);
+
+        // Add API key and signature to request header
+        struct curl_slist* headers = NULL;
+        headers = curl_slist_append(headers, ("API-Key: " + apiKey).c_str());
+        headers = curl_slist_append(headers, ("API-Sign: " + signature).c_str());
+        headers = curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded; charset=utf-8");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+        // Perform the request
+        CURLcode res = curl_easy_perform(curl);
+        if (res != CURLE_OK) {
+            std::cerr << "Failed to fetch Kraken account balance: " << curl_easy_strerror(res) << std::endl;
+            curl_easy_cleanup(curl);
+            return "";
+        }
+
+        // Clean up and return the response
+        curl_easy_cleanup(curl);
+        return responseBuffer;
+    }
+    else {
+        std::cerr << "Failed to initialize libcurl" << std::endl;
+        return "";
+    }
+}
+
 
 // Function to fetch Bitcoin price from CoinGecko API
 double getBitcoinPriceFromCoinGecko() {
@@ -56,61 +280,88 @@ double getBitcoinPriceFromCoinGecko() {
     }
 }
 
-std::string generateKrakenSignature(const std::string& postData, const std::string& apiSecret) {
-    unsigned char hmacResult[EVP_MAX_MD_SIZE];
-    unsigned int hmacLength = 0;
-    HMAC(EVP_sha512(), apiSecret.c_str(), apiSecret.length(),
-        reinterpret_cast<const unsigned char*>(postData.c_str()), postData.length(),
-        hmacResult, &hmacLength);
-
-    // Convert HMAC result to hexadecimal string
-    std::stringstream ss{}; // Initialize stringstream using braces
-    ss << std::hex << std::setfill('0');
-    for (unsigned int i = 0; i < hmacLength; ++i) {
-        ss << std::setw(2) << static_cast<unsigned int>(hmacResult[i]);
-    }
-    return ss.str();
-}
-
-std::string getKrakenBalances(const std::string& apiKey, const std::string& apiSecret) {
+double getBitcoinPriceFromKraken() {
     CURL* curl = curl_easy_init();
     if (curl) {
         std::string responseBuffer;
-        std::string postData = "nonce=" + std::to_string(time(NULL)); // Use current timestamp as nonce
-        std::string signature = generateKrakenSignature(postData, apiSecret);
-        curl_easy_setopt(curl, CURLOPT_URL, KRAKEN_API_ENDPOINT.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postData.c_str());
+        curl_easy_setopt(curl, CURLOPT_URL, "https://api.kraken.com/0/public/Ticker?pair=XXBTZUSD");
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseBuffer);
 
-        // Add API key and signature to request header
-        struct curl_slist* headers = NULL;
-        headers = curl_slist_append(headers, ("API-Key: " + apiKey).c_str());
-        headers = curl_slist_append(headers, ("API-Sign: " + signature).c_str());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
         CURLcode res = curl_easy_perform(curl);
         if (res != CURLE_OK) {
-            std::cerr << "Failed to fetch Kraken account balance: " << curl_easy_strerror(res) << std::endl;
+            std::cerr << "Failed to fetch Bitcoin price from Kraken API: " << curl_easy_strerror(res) << std::endl;
             curl_easy_cleanup(curl);
-            return "";
+            return 0.0;  // Return 0 if there's an error
         }
+
+        // Parse JSON response to extract Bitcoin price
+        rapidjson::Document document;
+        document.Parse(responseBuffer.c_str());
+        if (!document.IsObject() || !document.HasMember("result") || !document["result"].IsObject() || !document["result"].HasMember("XXBTZUSD") || !document["result"]["XXBTZUSD"].IsObject() || !document["result"]["XXBTZUSD"].HasMember("c") || !document["result"]["XXBTZUSD"]["c"].IsArray() || document["result"]["XXBTZUSD"]["c"].Empty()) {
+            std::cerr << "Failed to parse JSON response from Kraken API or missing 'c' array in result object" << std::endl;
+            curl_easy_cleanup(curl);
+            return 0.0;  // Return 0 if there's an error
+        }
+
+        double bitcoinPrice = std::stod(document["result"]["XXBTZUSD"]["c"][0].GetString());
         curl_easy_cleanup(curl);
-        return responseBuffer;
+        return bitcoinPrice;
     }
     else {
         std::cerr << "Failed to initialize libcurl" << std::endl;
-        return "";
+        return 0.0;  // Return 0 if there's an error
     }
 }
+
+double getBitcoinPriceFromBinance() {
+    CURL* curl = curl_easy_init();
+    if (curl) {
+        std::string responseBuffer;
+        curl_easy_setopt(curl, CURLOPT_URL, BINANCE_API_ENDPOINT.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseBuffer);
+
+        CURLcode res = curl_easy_perform(curl);
+        if (res != CURLE_OK) {
+            std::cerr << "Failed to fetch Bitcoin price from Binance API: " << curl_easy_strerror(res) << std::endl;
+            curl_easy_cleanup(curl);
+            return 0.0;  // Return 0 if there's an error
+        }
+
+        // Parse JSON response to extract Bitcoin price
+        rapidjson::Document document;
+        document.Parse(responseBuffer.c_str());
+        if (!document.IsObject() || !document.HasMember("price") || !document["price"].IsString()) {
+            std::cerr << "Failed to parse JSON response from Binance API or price is not a string" << std::endl;
+            curl_easy_cleanup(curl);
+            return 0.0;  // Return 0 if there's an error
+        }
+
+        double bitcoinPrice = std::stod(document["price"].GetString());
+        curl_easy_cleanup(curl);
+        return bitcoinPrice;
+    }
+    else {
+        std::cerr << "Failed to initialize libcurl" << std::endl;
+        return 0.0;  // Return 0 if there's an error
+    }
+}
+
+
+
+
 
 
 int main() {
     // Test the getBitcoinPriceFromCoinGecko() function
+    double bitcoinPrice_Gecko = getBitcoinPriceFromCoinGecko();
+    double bitcoinPrice_Kraken = getBitcoinPriceFromKraken();
+    double bitcoinPrice_Binance = getBitcoinPriceFromBinance();
+
     char* apiKeyValue;
     size_t bufferSize;
-    errno_t err = _dupenv_s(&apiKeyValue, &bufferSize, "API_KEY");
-    double bitcoinPrice = getBitcoinPriceFromCoinGecko();
+    errno_t err = _dupenv_s(&apiKeyValue, &bufferSize, "API_KEY_KRAKEN");
 
     // Check if the environment variable exists and was successfully retrieved
     if (err != 0) {
@@ -122,9 +373,9 @@ int main() {
         std::cerr << "API key environment variable not set." << std::endl;
         return 1;
     }
-    std::string API_KEY(apiKeyValue);
+    std::string API_KEY_KRAKEN(apiKeyValue);
 
-    err = _dupenv_s(&apiKeyValue, &bufferSize, "API_SECRET");
+    err = _dupenv_s(&apiKeyValue, &bufferSize, "API_SECRET_KRAKEN");
     // Check if the environment variable exists and was successfully retrieved
     if (err != 0) {
         std::cerr << "Failed to retrieve API_SECRET environment variable" << std::endl;
@@ -135,13 +386,15 @@ int main() {
         std::cerr << "API_SECRET environment variable not set." << std::endl;
         return 1;
     }
-    std::string API_SECRET(apiKeyValue);
-
+    std::string API_SECRET_KRAKEN(apiKeyValue);
     // Free the memory allocated for the environment variable value
-    free(apiKeyValue);
+    free(apiKeyValue);  
 
-    if (bitcoinPrice > 0.0) {
-        std::cout << "Bitcoin price (from CoinGecko): $" << bitcoinPrice << std::endl;
+
+
+
+    if (bitcoinPrice_Gecko > 0.0) {
+        std::cout << "Bitcoin price (from CoinGecko): $" << bitcoinPrice_Gecko << std::endl;
 
         double amountToInvest = 5; // Initial investment amount
         double amountOwned = 0.0; // Amount of Bitcoin owned
@@ -152,16 +405,28 @@ int main() {
         std::cerr << "Failed to fetch Bitcoin price from CoinGecko API" << std::endl;
     }
 
-    // Output the API key value
-    //std::cout << "API Key: " << API_KEY << std::endl;
-    //std::cout << "API SECRET: " << API_SECRET << std::endl;
+    if (bitcoinPrice_Kraken > 0.0) {
+        std::cout << "Bitcoin price from Kraken: $" << bitcoinPrice_Kraken << std::endl;
+    }
+    else {
+        std::cerr << "Failed to get Bitcoin price from Kraken" << std::endl;
+    }
 
-    // Call getKrakenBalances() function to retrieve account balances
-    std::string balancesResponse = getKrakenBalances(API_KEY, API_SECRET);
-    if (!balancesResponse.empty()) {
+    if (bitcoinPrice_Binance > 0.0) {
+        std::cout << "Bitcoin price (from Binance): $" << bitcoinPrice_Binance << std::endl;
+    }
+    else {
+        std::cerr << "Failed to fetch Bitcoin price from Binance API" << std::endl;
+    }
+
+ 
+    // URLPATH TO BUY ORDERS std::string urlpath = "/0/private/AddOrder";
+
+    std::string balancesResponse_KRAKEN = getKrakenBalances(API_KEY_KRAKEN, API_SECRET_KRAKEN);
+    if (!balancesResponse_KRAKEN.empty()) {
         // Parse the JSON response to extract account balances
         // Implement your parsing logic here based on the response format
-        std::cout << "Account Balances:\n" << balancesResponse << std::endl;
+        std::cout << "Account Balances:\n" << balancesResponse_KRAKEN << std::endl;
     }
     else {
         std::cerr << "Failed to fetch Kraken account balance" << std::endl;
