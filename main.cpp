@@ -41,7 +41,6 @@ static std::string generateNonce() {
 }
 
 
-
 static std::vector<unsigned char> sha256(const std::string& data) {
     std::vector<unsigned char> digest(SHA256_DIGEST_LENGTH);
 
@@ -118,7 +117,7 @@ static std::vector<unsigned char> b64_decode(const std::string& data) {
     return output;
 }
 
-static std::string base64_encode(const std::vector<unsigned char>& data) {
+static std::string b64_encode(const std::vector<unsigned char>& data) {
     BIO* bio, * b64;
     BUF_MEM* bufferPtr;
 
@@ -148,55 +147,58 @@ static std::string base64_encode(const std::vector<unsigned char>& data) {
 
 static std::vector<unsigned char> hmac_sha512(const std::vector<unsigned char>& data,
     const std::vector<unsigned char>& key) {
-    unsigned int len = EVP_MAX_MD_SIZE;
-    std::vector<unsigned char> digest(len);
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
 
-    HMAC_CTX* ctx = HMAC_CTX_new();
-    if (ctx == nullptr) {
-        // Handle error: unable to create HMAC_CTX
+    if (!ctx) {
+        // Handle error: unable to create EVP_MD_CTX
         return {};
     }
 
-    if (HMAC_Init_ex(ctx, key.data(), key.size(), EVP_sha512(), NULL) != 1) {
-        HMAC_CTX_free(ctx);
+    if (!EVP_DigestSignInit(ctx, NULL, EVP_sha512(), NULL, NULL)) {
+        EVP_MD_CTX_free(ctx);
         // Handle error: initialization failed
         return {};
     }
 
-    if (HMAC_Update(ctx, data.data(), data.size()) != 1) {
-        HMAC_CTX_free(ctx);
+    if (!EVP_DigestSignUpdate(ctx, data.data(), data.size())) {
+        EVP_MD_CTX_free(ctx);
         // Handle error: update failed
         return {};
     }
 
-    if (HMAC_Final(ctx, digest.data(), &len) != 1) {
-        HMAC_CTX_free(ctx);
-        // Handle error: finalization failed
+    size_t len;
+    if (!EVP_DigestSignFinal(ctx, NULL, &len)) {
+        EVP_MD_CTX_free(ctx);
+        // Handle error: finalization failed to get length
         return {};
     }
 
-    HMAC_CTX_free(ctx);
+    std::vector<unsigned char> digest(len);
+    if (!EVP_DigestSignFinal(ctx, digest.data(), &len)) {
+        EVP_MD_CTX_free(ctx);
+        // Handle error: finalization failed to get result
+        return {};
+    }
+
+    EVP_MD_CTX_free(ctx);
     return digest;
 }
 
+static std::string GetKrakenSignature(const std::string& path,
+    const std::string& nonce,
+    const std::string& postdata, const std::string &secret_)
+{
+    // add path to data to encrypt
+    std::vector<unsigned char> data(path.begin(), path.end());
 
-static std::string generateKrakenSignature(const std::string& urlpath, const std::string& postData, const std::string& apiSecret) {
-    // Concatenate URI path and SHA256 hash of nonce + POST data
-    std::string message = urlpath + sha256(postData);
+    // concatenate nonce and postdata and compute SHA256
+    std::vector<unsigned char> nonce_postdata = sha256(nonce + postdata);
 
-    // Compute HMAC-SHA512 hash using API secret
-    unsigned char hmacResult[EVP_MAX_MD_SIZE];
-    unsigned int hmacLength = 0;
-    HMAC(EVP_sha512(), apiSecret.c_str(), apiSecret.length(), reinterpret_cast<const unsigned char*>(message.c_str()), message.length(), hmacResult, &hmacLength);
+    // concatenate path and nonce_postdata (path + sha256(nonce + postdata))
+    data.insert(data.end(), nonce_postdata.begin(), nonce_postdata.end());
 
-    // Convert hash to hexadecimal string
-    std::stringstream ss;
-    ss << std::hex << std::setfill('0');
-    for (unsigned int i = 0; i < hmacLength; ++i) {
-        ss << std::setw(2) << static_cast<unsigned int>(hmacResult[i]);
-    }
-
-    return ss.str();
+    // and compute HMAC
+    return b64_encode(hmac_sha512(data, b64_decode(secret_.c_str())));
 }
 
 std::string getKrakenBalances(const std::string& apiKey, const std::string& apiSecret) {
@@ -210,22 +212,27 @@ std::string getKrakenBalances(const std::string& apiKey, const std::string& apiS
         // Construct POST data
         std::string postData = "nonce=" + nonce; // Include nonce in the POST data
 
+        std::string url = "https://api.kraken.com/0/private/Balance";
+
         // Generate signature
-        std::string signature = generateKrakenSignature("0/private/Balance", postData, apiSecret);
+        std::string signature = GetKrakenSignature(url, nonce, postData, apiSecret);
+
 
         // Set up CURL options
-        curl_easy_setopt(curl, CURLOPT_URL, "https://api.kraken.com/0/private/Balance");
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postData.c_str());
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseBuffer);
 
         // Add API key and signature to request header
+       
+
         struct curl_slist* headers = NULL;
         headers = curl_slist_append(headers, ("API-Key: " + apiKey).c_str());
         headers = curl_slist_append(headers, ("API-Sign: " + signature).c_str());
         headers = curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded; charset=utf-8");
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
+       
         // Perform the request
         CURLcode res = curl_easy_perform(curl);
         if (res != CURLE_OK) {
@@ -236,6 +243,9 @@ std::string getKrakenBalances(const std::string& apiKey, const std::string& apiS
 
         // Clean up and return the response
         curl_easy_cleanup(curl);
+
+        curl_slist_free_all(headers);
+
         return responseBuffer;
     }
     else {
