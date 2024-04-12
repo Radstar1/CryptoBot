@@ -4,11 +4,13 @@
 #include <chrono>
 #include <curl/curl.h> // Include libcurl for making HTTP requests
 #include <rapidjson/document.h> // Include RapidJSON for JSON parsing
+#include <openssl/ssl.h>
 #include <openssl/sha.h>
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/buffer.h>
+#include <openssl/err.h>
 #include <iomanip> // Include <iomanip> for setfill and setw
 #include <vector>
 
@@ -18,7 +20,21 @@ const std::string BINANCE_API_ENDPOINT = "https://api.binance.us/api/v3/ticker/p
 const std::string KRAKEN_API_ENDPOINT = "https://api.kraken.com/0/public/Assets";
 const std::string KRAKEN_API_BALANCE_ENDPOINT = "https://api.kraken.com/0/private/Balance";
 
+void initializeOpenSSL() {
+    SSL_library_init();
+    OpenSSL_add_all_algorithms();
+    SSL_load_error_strings();
+}
 
+void printOpenSSLErrors() {
+    unsigned long err;
+    while ((err = ERR_get_error()) != 0) {
+        char* err_msg = ERR_error_string(err, nullptr);
+        if (err_msg) {
+            std::cerr << "OpenSSL Error: " << err_msg << std::endl;
+        }
+    }
+}
 
 // Callback function to write response data from HTTP request
 size_t writeCallback(void* contents, size_t size, size_t nmemb, std::string* buffer) {
@@ -41,41 +57,7 @@ static std::string generateNonce() {
 }
 
 
-static std::vector<unsigned char> sha256(const std::string& data) {
-    std::vector<unsigned char> digest(SHA256_DIGEST_LENGTH);
 
-    // Initialize SHA256 context
-    EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
-    if (mdctx == nullptr) {
-        // Handle error: unable to create EVP_MD_CTX
-        return {};
-    }
-
-    // Initialize SHA256
-    if (EVP_DigestInit_ex(mdctx, EVP_sha256(), nullptr) != 1) {
-        EVP_MD_CTX_free(mdctx);
-        // Handle error: initialization failed
-        return {};
-    }
-
-    // Update SHA256 context with data
-    if (EVP_DigestUpdate(mdctx, data.c_str(), data.length()) != 1) {
-        EVP_MD_CTX_free(mdctx);
-        // Handle error: update failed
-        return {};
-    }
-
-    // Finalize SHA256 hash
-    if (EVP_DigestFinal_ex(mdctx, digest.data(), nullptr) != 1) {
-        EVP_MD_CTX_free(mdctx);
-        // Handle error: finalization failed
-        return {};
-    }
-
-    EVP_MD_CTX_free(mdctx);
-
-    return digest;
-}
 
 static std::vector<unsigned char> b64_decode(const std::string& data) {
     // Create a BIO for base64 decoding
@@ -145,77 +127,118 @@ static std::string b64_encode(const std::vector<unsigned char>& data) {
     return encodedData;
 }
 
-static std::vector<unsigned char> hmac_sha512(const std::vector<unsigned char>& data,
-    const std::vector<unsigned char>& key) {
-    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-
-    if (!ctx) {
-        // Handle error: unable to create EVP_MD_CTX
+static std::vector<unsigned char> sha256(const std::string& data) {
+    const EVP_MD* sha256 = EVP_MD_fetch(NULL, "SHA256", NULL);
+    if (sha256 == nullptr) {
+        // Handle error: unable to fetch SHA256 implementation
         return {};
     }
 
-    if (!EVP_DigestSignInit(ctx, NULL, EVP_sha512(), NULL, NULL)) {
-        EVP_MD_CTX_free(ctx);
+    // Initialize SHA256 context
+    EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
+    if (mdctx == nullptr) {
+        // Handle error: unable to create EVP_MD_CTX
+        EVP_MD_free((EVP_MD*)sha256); // Free the SHA256 implementation object
+        return {};
+    }
+
+    // Initialize SHA256
+    if (EVP_DigestInit_ex(mdctx, sha256, nullptr) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        EVP_MD_free((EVP_MD*)sha256); // Free the SHA256 implementation object
         // Handle error: initialization failed
         return {};
     }
 
-    if (!EVP_DigestSignUpdate(ctx, data.data(), data.size())) {
-        EVP_MD_CTX_free(ctx);
+    // Update SHA256 context with data
+    if (EVP_DigestUpdate(mdctx, data.c_str(), data.length()) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        EVP_MD_free((EVP_MD*)sha256); // Free the SHA256 implementation object
         // Handle error: update failed
         return {};
     }
 
-    size_t len;
-    if (!EVP_DigestSignFinal(ctx, NULL, &len)) {
-        EVP_MD_CTX_free(ctx);
-        // Handle error: finalization failed to get length
+    // Finalize SHA256 hash
+    std::vector<unsigned char> digest(SHA256_DIGEST_LENGTH);
+    if (EVP_DigestFinal_ex(mdctx, digest.data(), nullptr) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        EVP_MD_free((EVP_MD*)sha256); // Free the SHA256 implementation object
+        // Handle error: finalization failed
         return {};
     }
 
-    std::vector<unsigned char> digest(len);
-    if (!EVP_DigestSignFinal(ctx, digest.data(), &len)) {
-        EVP_MD_CTX_free(ctx);
-        // Handle error: finalization failed to get result
-        return {};
-    }
+    EVP_MD_CTX_free(mdctx);
+    EVP_MD_free((EVP_MD*)sha256); // Free the SHA256 implementation object
 
-    EVP_MD_CTX_free(ctx);
+
     return digest;
 }
 
+
+static std::vector<unsigned char> hmac_sha512(const std::vector<unsigned char>& data,
+    const std::vector<unsigned char>& key) {
+    unsigned char* result;
+    unsigned int result_len;
+    result = HMAC(EVP_sha512(), key.data(), key.size(), data.data(), data.size(), NULL, &result_len);
+    std::vector<unsigned char> hmac(result, result + result_len);
+    return hmac;
+}
+
+
 static std::string GetKrakenSignature(const std::string& path,
     const std::string& nonce,
-    const std::string& postdata, const std::string &secret_)
+    const std::string& postData, const std::string &secret_)
 {
-    // add path to data to encrypt
-    std::vector<unsigned char> data(path.begin(), path.end());
 
-    // concatenate nonce and postdata and compute SHA256
-    std::vector<unsigned char> nonce_postdata = sha256(nonce + postdata);
+    //Step 1: Concatenate postData + nonce + endpointPath
+    std::string concatenate = postData + nonce + path;
 
-    // concatenate path and nonce_postdata (path + sha256(nonce + postdata))
-    data.insert(data.end(), nonce_postdata.begin(), nonce_postdata.end());
+    //Step 2: Hash the result of step 1 with the SHA-256 algorithm
+    std::vector<unsigned char> hashResult = sha256(concatenate);
 
-    // and compute HMAC
-    return b64_encode(hmac_sha512(data, b64_decode(secret_.c_str())));
+    // Print out the hash result
+    std::cout << "SHA256 Hash: ";
+    for (unsigned char byte : hashResult) {
+        // Print each byte of the hash result as a hexadecimal number
+        std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)byte;
+    }
+    std::cout << std::endl;
+
+    //Step 3: Base64-decode your api_secret
+     std::vector<unsigned char> b64_decode_output = b64_decode(secret_);
+
+
+    //Step 4: Use the result of step 3 to hash the result of the step 2 with the HMAC-SHA-512 algorithm
+     std::vector<unsigned char> hmacResult = hmac_sha512(hashResult, b64_decode_output);
+
+    //Step 5: Base64-encode the result of step 4
+    std::string b64_encode_output = b64_encode(hmacResult);
+
+    
+
+    //std::cout << b64_encode_output;
+
+    return b64_encode_output;
 }
+
+
 
 std::string getKrakenBalances(const std::string& apiKey, const std::string& apiSecret) {
     CURL* curl = curl_easy_init();
     if (curl) {
         std::string responseBuffer;
 
-        // Generate nonce (timestamp in milliseconds)
-        std::string nonce = generateNonce();
-
         // Construct POST data
+        std::string url = "https://api.kraken.com/";
+        std::string nonce = generateNonce();
+        std::string path = "/0/private/Balance";
         std::string postData = "nonce=" + nonce; // Include nonce in the POST data
+        std::string concatenate = postData + nonce + path;
 
-        std::string url = "https://api.kraken.com/0/private/Balance";
 
         // Generate signature
-        std::string signature = GetKrakenSignature(url, nonce, postData, apiSecret);
+
+        std::string signature = GetKrakenSignature(path, nonce, postData, apiSecret);
 
 
         // Set up CURL options
@@ -364,10 +387,11 @@ double getBitcoinPriceFromBinance() {
 
 
 int main() {
+    initializeOpenSSL();
     // Test the getBitcoinPriceFromCoinGecko() function
     double bitcoinPrice_Gecko = getBitcoinPriceFromCoinGecko();
     double bitcoinPrice_Kraken = getBitcoinPriceFromKraken();
-    double bitcoinPrice_Binance = getBitcoinPriceFromBinance();
+    //double bitcoinPrice_Binance = getBitcoinPriceFromBinance();
 
     char* apiKeyValue;
     size_t bufferSize;
@@ -422,13 +446,13 @@ int main() {
         std::cerr << "Failed to get Bitcoin price from Kraken" << std::endl;
     }
 
-    if (bitcoinPrice_Binance > 0.0) {
+    /*if (bitcoinPrice_Binance > 0.0) {
         std::cout << "Bitcoin price (from Binance): $" << bitcoinPrice_Binance << std::endl;
     }
     else {
         std::cerr << "Failed to fetch Bitcoin price from Binance API" << std::endl;
     }
-
+    */
  
     // URLPATH TO BUY ORDERS std::string urlpath = "/0/private/AddOrder";
 
