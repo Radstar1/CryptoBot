@@ -26,22 +26,14 @@ void initializeOpenSSL() {
     SSL_load_error_strings();
 }
 
-void printOpenSSLErrors() {
-    unsigned long err;
-    while ((err = ERR_get_error()) != 0) {
-        char* err_msg = ERR_error_string(err, nullptr);
-        if (err_msg) {
-            std::cerr << "OpenSSL Error: " << err_msg << std::endl;
-        }
-    }
-}
-
 // Callback function to write response data from HTTP request
-size_t writeCallback(void* contents, size_t size, size_t nmemb, std::string* buffer) {
+static size_t writeCallback(void* contents, size_t size, size_t nmemb, std::string* buffer) {
     size_t totalSize = size * nmemb;
     buffer->append((char*)contents, totalSize);
     return totalSize;
 }
+
+
 
 static std::string generateNonce() {
     // Get the current time in milliseconds since the epoch
@@ -55,9 +47,6 @@ static std::string generateNonce() {
 
     return ss.str();
 }
-
-
-
 
 static std::vector<unsigned char> b64_decode(const std::string& data) {
     // Create a BIO for base64 decoding
@@ -185,43 +174,37 @@ static std::vector<unsigned char> hmac_sha512(const std::vector<unsigned char>& 
 }
 
 
-static std::string GetKrakenSignature(const std::string& path,
+static std::string GetKrakenSignature(const std::string& endpoint,
     const std::string& nonce,
-    const std::string& postData, const std::string &secret_)
+    const std::string& postData, const std::string& secret_)
 {
+    //Step 1: Base64-decode your api_secret
+    std::vector<unsigned char> b64_decode_secret_ = b64_decode(secret_);
+  
+    std::string concatenate = nonce + postData;
+    std::vector<unsigned char> api_sha256 = sha256(concatenate);
 
-    //Step 1: Concatenate postData + nonce + endpointPath
-    std::string concatenate = postData + nonce + path;
 
-    //Step 2: Hash the result of step 1 with the SHA-256 algorithm
-    std::vector<unsigned char> hashResult = sha256(concatenate);
+    //Step 2: Create a new unsigned vector with the path (unsigned meaning positive ranging from 0-255)
+    //This is so I can concatenate it with the api_sha256 hash later
+    std::string path = "/0/private/" + endpoint;
+    std::vector<unsigned char> path_sha256(path.begin(), path.end());
 
-    // Print out the hash result
-    std::cout << "SHA256 Hash: ";
-    for (unsigned char byte : hashResult) {
-        // Print each byte of the hash result as a hexadecimal number
-        std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)byte;
+  
+   //Step 3:Concatenate it
+    path_sha256.reserve(api_sha256.size() + path_sha256.size());
+    for (int num : api_sha256) {
+        path_sha256.push_back(num);
     }
-    std::cout << std::endl;
-
-    //Step 3: Base64-decode your api_secret
-     std::vector<unsigned char> b64_decode_output = b64_decode(secret_);
-
 
     //Step 4: Use the result of step 3 to hash the result of the step 2 with the HMAC-SHA-512 algorithm
-     std::vector<unsigned char> hmacResult = hmac_sha512(hashResult, b64_decode_output);
+    std::vector<unsigned char> hmacResult = hmac_sha512(path_sha256, b64_decode_secret_);
 
     //Step 5: Base64-encode the result of step 4
-    std::string b64_encode_output = b64_encode(hmacResult);
+    std::string signature = b64_encode(hmacResult);
 
-    
-
-    //std::cout << b64_encode_output;
-
-    return b64_encode_output;
+    return signature;
 }
-
-
 
 std::string getKrakenBalances(const std::string& apiKey, const std::string& apiSecret) {
     CURL* curl = curl_easy_init();
@@ -229,17 +212,15 @@ std::string getKrakenBalances(const std::string& apiKey, const std::string& apiS
         std::string responseBuffer;
 
         // Construct POST data
-        std::string url = "https://api.kraken.com/";
         std::string nonce = generateNonce();
-        std::string path = "/0/private/Balance";
+        std::string url = "https://api.kraken.com/0/private/Balance";
+        std::string endpoint = "Balance";
         std::string postData = "nonce=" + nonce; // Include nonce in the POST data
-        std::string concatenate = postData + nonce + path;
 
+        std::cout << nonce;
 
         // Generate signature
-
-        std::string signature = GetKrakenSignature(path, nonce, postData, apiSecret);
-
+        std::string signature = GetKrakenSignature(endpoint, nonce, postData, apiSecret);
 
         // Set up CURL options
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
@@ -276,7 +257,6 @@ std::string getKrakenBalances(const std::string& apiKey, const std::string& apiS
         return "";
     }
 }
-
 
 // Function to fetch Bitcoin price from CoinGecko API
 double getBitcoinPriceFromCoinGecko() {
@@ -347,51 +327,13 @@ double getBitcoinPriceFromKraken() {
     }
 }
 
-double getBitcoinPriceFromBinance() {
-    CURL* curl = curl_easy_init();
-    if (curl) {
-        std::string responseBuffer;
-        curl_easy_setopt(curl, CURLOPT_URL, BINANCE_API_ENDPOINT.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseBuffer);
-
-        CURLcode res = curl_easy_perform(curl);
-        if (res != CURLE_OK) {
-            std::cerr << "Failed to fetch Bitcoin price from Binance API: " << curl_easy_strerror(res) << std::endl;
-            curl_easy_cleanup(curl);
-            return 0.0;  // Return 0 if there's an error
-        }
-
-        // Parse JSON response to extract Bitcoin price
-        rapidjson::Document document;
-        document.Parse(responseBuffer.c_str());
-        if (!document.IsObject() || !document.HasMember("price") || !document["price"].IsString()) {
-            std::cerr << "Failed to parse JSON response from Binance API or price is not a string" << std::endl;
-            curl_easy_cleanup(curl);
-            return 0.0;  // Return 0 if there's an error
-        }
-
-        double bitcoinPrice = std::stod(document["price"].GetString());
-        curl_easy_cleanup(curl);
-        return bitcoinPrice;
-    }
-    else {
-        std::cerr << "Failed to initialize libcurl" << std::endl;
-        return 0.0;  // Return 0 if there's an error
-    }
-}
-
-
 
 
 
 
 int main() {
-    initializeOpenSSL();
-    // Test the getBitcoinPriceFromCoinGecko() function
     double bitcoinPrice_Gecko = getBitcoinPriceFromCoinGecko();
     double bitcoinPrice_Kraken = getBitcoinPriceFromKraken();
-    //double bitcoinPrice_Binance = getBitcoinPriceFromBinance();
 
     char* apiKeyValue;
     size_t bufferSize;
@@ -426,7 +368,6 @@ int main() {
 
 
 
-
     if (bitcoinPrice_Gecko > 0.0) {
         std::cout << "Bitcoin price (from CoinGecko): $" << bitcoinPrice_Gecko << std::endl;
 
@@ -446,15 +387,7 @@ int main() {
         std::cerr << "Failed to get Bitcoin price from Kraken" << std::endl;
     }
 
-    /*if (bitcoinPrice_Binance > 0.0) {
-        std::cout << "Bitcoin price (from Binance): $" << bitcoinPrice_Binance << std::endl;
-    }
-    else {
-        std::cerr << "Failed to fetch Bitcoin price from Binance API" << std::endl;
-    }
-    */
- 
-    // URLPATH TO BUY ORDERS std::string urlpath = "/0/private/AddOrder";
+
 
     std::string balancesResponse_KRAKEN = getKrakenBalances(API_KEY_KRAKEN, API_SECRET_KRAKEN);
     if (!balancesResponse_KRAKEN.empty()) {
