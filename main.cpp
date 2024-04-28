@@ -14,6 +14,7 @@
 #include <iomanip> // Include <iomanip> for setfill and setw
 #include <vector>
 
+
 // Example API endpoint for getting Bitcoin price from CoinGecko
 const std::string COINGECKO_API_ENDPOINT = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd";
 const std::string BINANCE_API_ENDPOINT = "https://api.binance.us/api/v3/ticker/price?symbol=BTCUSD";
@@ -332,12 +333,14 @@ double getBitcoinPriceFromKraken() {
 
 
 int main() {
+
+    std::cout << 'woah';
     double bitcoinPrice_Gecko = getBitcoinPriceFromCoinGecko();
     double bitcoinPrice_Kraken = getBitcoinPriceFromKraken();
 
     char* apiKeyValue;
     size_t bufferSize;
-    errno_t err = _dupenv_s(&apiKeyValue, &bufferSize, "API_KEY_KRAKEN");
+    errno_t err = _dupenv_s(&apiKeyValue, &bufferSize, "API_KEY_KRAKEN"); //Set your Kraken Key in your Windows Environment
 
     // Check if the environment variable exists and was successfully retrieved
     if (err != 0) {
